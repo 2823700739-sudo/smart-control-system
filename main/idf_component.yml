@@ -15,3 +15,5 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/apds9960: ^0.1.0
+  espressif/esp32-camera: ^2.1.6
+  espressif/st7789: "^1.0.0"
