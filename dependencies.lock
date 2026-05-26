@@ -1,0 +1,53 @@
+dependencies:
+  espressif/apds9960:
+    component_hash: 9fbe7b60ae41b6df962fd8742dfc7cce168d721cd792926d2522fd7bdd028d55
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: espressif/i2c_bus
+      registry_url: https://components.espressif.com
+      require: public
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.1.0
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
+  espressif/i2c_bus:
+    component_hash: 804ec068d163570fd367b279a310ca383484630d2310c586b50def0bcf21de13
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.5.1
+  idf:
+    source:
+      type: idf
+    version: 5.5.4
+direct_dependencies:
+- espressif/apds9960
+- idf
+manifest_hash: 6515e62b85177bebcb4104de9e0ca615031fcae74da74b627dfbe17b9676a13b
+target: esp32s3
+version: 2.0.0
