@@ -1,191 +1,492 @@
+/**
+ * @file main.c
+ * @brief ESP32-S3 手势识别与模型控制主程序
+ * 
+ * 功能：
+ * 1. 使用 APDS9960 手势传感器控制 LED 亮度
+ * 2. 通过 UDP 传输摄像头图像到 PC
+ * 3. 通过 Boot 按钮切换控制模式（手势/模型）
+ * 4. 通过 UDP 命令接收 PC 端模型推理结果控制 LED
+ */
+
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_camera.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "img_converters.h"
 #include "apds9960.h"
+#include "camera.h"
+#include "lcd.h"
+#include "spi.h"
 #include "led.h"
 
+// 日志标签
 static const char *TAG = "MAIN";
 
-// ========== APDS9960 配置（使用 I2C_NUM_1，引脚 GPIO1/2）==========
-#define APDS9960_I2C_PORT        I2C_NUM_1
-#define APDS9960_SCL_IO          GPIO_NUM_2
-#define APDS9960_SDA_IO          GPIO_NUM_1
-#define APDS9960_I2C_ADDR        0x39
-#define I2C_MASTER_FREQ_HZ       100000
+// WiFi 配置
+#define WIFI_SSID      "Crystal"      // WiFi 名称
+#define WIFI_PASS      "xixiaini44"   // WiFi 密码
 
-// ========== OV2640 摄像头配置（强制使用 I2C_NUM_0，引脚 GPIO18/19）==========
-#define CAM_PWDN_GPIO            GPIO_NUM_16
-#define CAM_RESET_GPIO           GPIO_NUM_15
-#define CAM_XCLK_GPIO            -1
-#define CAM_SIOD_GPIO            GPIO_NUM_19
-#define CAM_SIOC_GPIO            GPIO_NUM_18
+// 网络端口配置
+#define UDP_PORT       5555           // 图像传输端口
+#define CMD_PORT       5556           // 命令接收端口
+#define PC_IP          "192.168.137.1" // PC 端 IP 地址
 
-#define CAM_D7_GPIO              GPIO_NUM_11
-#define CAM_D6_GPIO              GPIO_NUM_10
-#define CAM_D5_GPIO              GPIO_NUM_9
-#define CAM_D4_GPIO              GPIO_NUM_8
-#define CAM_D3_GPIO              GPIO_NUM_7
-#define CAM_D2_GPIO              GPIO_NUM_6
-#define CAM_D1_GPIO              GPIO_NUM_5
-#define CAM_D0_GPIO              GPIO_NUM_4
+// 手势控制超时时间（3秒）
+#define GESTURE_TO     3000000
 
-#define CAM_VSYNC_GPIO           GPIO_NUM_14
-#define CAM_HREF_GPIO            GPIO_NUM_13
-#define CAM_PCLK_GPIO            GPIO_NUM_12
+// 按钮配置（使用开发板自带的 Boot 按钮）
+#define BTN_MODE       GPIO_NUM_0
 
-// 手势回调
-static void gesture_callback(uint8_t gesture)
+// 控制模式定义
+#define MODE_GESTURE   0              // 手势控制模式
+#define MODE_MODEL     1              // 模型控制模式
+
+// 当前控制模式
+static int control_mode = MODE_GESTURE;
+
+// 外部变量声明
+extern uint8_t *lcd_buf;
+
+// 网络相关变量
+static int udp_sock = -1;             // UDP 图像传输套接字
+static int cmd_sock = -1;             // UDP 命令接收套接字
+static struct sockaddr_in pc_addr;    // PC 端地址
+
+// LED 亮度控制变量
+static int pc_brightness = 0;         // PC 模型控制的亮度值
+static int64_t gesture_expire = 0;    // 手势控制超时时间戳
+static int current_brightness = -1;   // 当前 LED 亮度
+
+/**
+ * @brief 设置 LED 亮度
+ * @param level 亮度级别 (0=OFF, 1=LOW, 2=MED, 3=HIGH)
+ */
+static void apply_led(int level)
 {
-    switch (gesture) {
-        case APDS9960_UP:    ESP_LOGI(TAG, "手势：向上"); break;
-        case APDS9960_DOWN:  ESP_LOGI(TAG, "手势：向下"); break;
-        case APDS9960_LEFT:  ESP_LOGI(TAG, "手势：向左"); gpio_toggle(GPIO_NUM_46); break;
-        case APDS9960_RIGHT: ESP_LOGI(TAG, "手势：向右"); gpio_toggle(GPIO_NUM_46); break;
-        default: break;
+    // 如果亮度没有变化，直接返回
+    if (level == current_brightness)
+        return;
+    
+    current_brightness = level;
+    led_set_brightness(level);
+
+    // 定义亮度级别名称
+    static const char *names[] = {"OFF", "LOW", "MED", "HIGH"};
+    ESP_LOGI(TAG, "LED -> %s", names[level]);
+}
+
+/**
+ * @brief WiFi 事件处理函数
+ */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    switch (id) {
+        case WIFI_EVENT_STA_START:
+            ESP_LOGI(TAG, "WiFi 启动，开始连接...");
+            esp_wifi_connect();
+            break;
+        case WIFI_EVENT_STA_DISCONNECTED:
+            ESP_LOGW(TAG, "WiFi 断开连接，重新连接...");
+            esp_wifi_connect();
+            break;
+        case IP_EVENT_STA_GOT_IP: {
+            ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
+            ESP_LOGI(TAG, "WiFi 连接成功，IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+            break;
+        }
+        default:
+            break;
     }
 }
 
-// 初始化 APDS9960（独立 I2C_NUM_1）
-static apds9960_handle_t init_apds9960(void)
+/**
+ * @brief 初始化 WiFi 连接
+ */
+static void wifi_init(void)
 {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = APDS9960_SDA_IO,
-        .scl_io_num = APDS9960_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-    i2c_bus_handle_t i2c_bus = i2c_bus_create(APDS9960_I2C_PORT, &conf);
-    if (!i2c_bus) {
-        ESP_LOGE(TAG, "APDS9960 I2C bus creation failed");
-        return NULL;
-    }
+    // 初始化 NVS
+    ESP_ERROR_CHECK(nvs_flash_init());
+    
+    // 初始化网络接口
+    ESP_ERROR_CHECK(esp_netif_init());
+    
+    // 创建默认事件循环
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // 创建默认 WiFi STA 接口
+    esp_netif_create_default_wifi_sta();
 
-    apds9960_handle_t apds9960 = apds9960_create(i2c_bus, APDS9960_I2C_ADDR);
-    if (!apds9960) {
-        ESP_LOGE(TAG, "APDS9960 device creation failed");
-        return NULL;
-    }
+    // 初始化 WiFi 配置
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    uint8_t dev_id = 0;
-    apds9960_get_deviceid(apds9960, &dev_id);
-    ESP_LOGI(TAG, "APDS9960 Device ID: 0x%02X", dev_id);
-    if (dev_id != APDS9960_WHO_AM_I_VAL) {
-        ESP_LOGE(TAG, "Invalid APDS9960 Device ID! Check wiring.");
-        return NULL;
-    }
+    // 注册 WiFi 事件处理
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, NULL));
 
-    esp_err_t err = apds9960_gesture_init(apds9960);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "APDS9960 gesture init failed: %s", esp_err_to_name(err));
-        return NULL;
-    }
+    // 配置 WiFi SSID 和密码
+    wifi_config_t wifi_cfg = {0};
+    strcpy((char *)wifi_cfg.sta.ssid, WIFI_SSID);
+    strcpy((char *)wifi_cfg.sta.password, WIFI_PASS);
 
-    ESP_LOGI(TAG, "APDS9960 gesture sensor ready");
-    return apds9960;
+    // 设置 WiFi 模式为 STA
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-// 初始化 OV2640 摄像头（强制使用 I2C_NUM_0）
-static esp_err_t init_camera(void)
+/**
+ * @brief 在 LCD 上显示摄像头帧
+ * @param fb 摄像头帧缓冲区
+ */
+static void show_frame(camera_fb_t *fb)
 {
-    // 手动复位和使能引脚
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << CAM_PWDN_GPIO) | (1ULL << CAM_RESET_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .intr_type = GPIO_INTR_DISABLE,
-        .pull_down_en = 0,
-        .pull_up_en = 0,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(CAM_PWDN_GPIO, 0);   // 使能摄像头
-    gpio_set_level(CAM_RESET_GPIO, 1);  // 解除复位
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // 计算帧数据大小（RGB565 格式）
+    unsigned long bytes = (unsigned long)(fb->width * fb->height * 2);
+    
+    // 设置 LCD 显示窗口
+    lcd_set_window(0, 0, fb->width - 1, fb->height - 1);
+    
+    // 将帧数据复制到 LCD 缓冲区
+    memcpy(lcd_buf, fb->buf, bytes);
 
-    camera_config_t config = {
-        .pin_pwdn  = CAM_PWDN_GPIO,
-        .pin_reset = CAM_RESET_GPIO,
-        .pin_xclk  = CAM_XCLK_GPIO,
-        .pin_sscb_sda = CAM_SIOD_GPIO,
-        .pin_sscb_scl = CAM_SIOC_GPIO,
-
-        .pin_d7 = CAM_D7_GPIO,
-        .pin_d6 = CAM_D6_GPIO,
-        .pin_d5 = CAM_D5_GPIO,
-        .pin_d4 = CAM_D4_GPIO,
-        .pin_d3 = CAM_D3_GPIO,
-        .pin_d2 = CAM_D2_GPIO,
-        .pin_d1 = CAM_D1_GPIO,
-        .pin_d0 = CAM_D0_GPIO,
-
-        .pin_vsync = CAM_VSYNC_GPIO,
-        .pin_href  = CAM_HREF_GPIO,
-        .pin_pclk  = CAM_PCLK_GPIO,
-
-        .xclk_freq_hz = 20000000,
-        .ledc_timer = LEDC_TIMER_0,
-        .ledc_channel = LEDC_CHANNEL_0,
-        .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,
-        .jpeg_quality = 12,
-        .fb_count = 1,
-
-        // .sccb_i2c_port = 0,           // 强制使用 I2C_NUM_0，避免与 APDS9960 冲突
-    };
-
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
-        return err;
+    // 分块写入 LCD（每块 11520 字节）
+    unsigned long chunk = 11520;
+    unsigned long full = bytes / chunk;
+    unsigned long rem = bytes % chunk;
+    
+    for (unsigned long j = 0; j < full; j++) {
+        lcd_write_datan(&lcd_buf[j * chunk], chunk);
     }
-    ESP_LOGI(TAG, "Camera initialized");
-    return ESP_OK;
+    if (rem > 0) {
+        lcd_write_datan(&lcd_buf[full * chunk], rem);
+    }
 }
 
+/**
+ * @brief 检查 UDP 命令接收套接字
+ * 
+ * 从 PC 端接收 LED 亮度控制命令
+ */
+static void check_cmd_socket(void)
+{
+    uint8_t buf[4];
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+    
+    // 非阻塞方式接收数据
+    //参数：
+    //cmd_sock：套接字描述符
+    //buf：接收缓冲区
+    //sizeof(buf)：缓冲区大小
+    //MSG_DONTWAIT：非阻塞接收
+    //from：客户端地址
+    //fromlen：客户端地址长度
+    //返回值：接收的字节数
+    int n = recvfrom(cmd_sock, buf, sizeof(buf), MSG_DONTWAIT,
+                     (struct sockaddr *)&from, &fromlen);
+    
+    if (n >= 1) {
+        // 将字符转换为数字（'0'-'3' -> 0-3）
+        int cmd = buf[0] - '0';
+        if (cmd >= 0 && cmd <= 3) {
+            pc_brightness = cmd;
+            ESP_LOGI(TAG, "PC 命令: 亮度=%d", cmd);
+        }
+    }
+}
+
+/**
+ * @brief 检查手势控制状态
+ * 
+ * 处理 APDS9960 手势传感器的输出，控制 LED 亮度
+ */
+static void check_gesture(void)
+{
+    // 如果有新的手势命令
+    if (g_gesture_override) {
+        gesture_expire = esp_timer_get_time() + GESTURE_TO;
+        g_gesture_override = 0;
+        apply_led(g_gesture_brightness);
+        ESP_LOGI(TAG, "手势控制: %d (3秒超时)", g_gesture_brightness);
+    }
+
+    // 检查手势控制是否超时
+    if (gesture_expire > 0) {
+        if (esp_timer_get_time() < gesture_expire) {
+            return;  // 还在超时时间内，保持当前亮度
+        }
+        gesture_expire = 0;
+        ESP_LOGI(TAG, "手势控制超时");
+    }
+}
+
+/**
+ * @brief 控制逻辑主循环
+ * 
+ * 根据当前模式调用对应的控制函数
+ */
+static void control_tick(void)
+{
+    if (control_mode == MODE_GESTURE) {
+        // 手势控制模式
+        check_gesture();
+    } else {
+        // 模型控制模式
+        check_cmd_socket();
+        apply_led(pc_brightness);
+    }
+}
+
+// 按键状态枚举
+typedef enum {
+    KEY_STATE_IDLE,       // 空闲状态（按键未按下）
+    KEY_STATE_DEBOUNCE,   // 消抖状态
+    KEY_STATE_PRESSED,    // 按键已按下（等待释放）
+} key_state_t;
+
+// 按键状态变量
+static key_state_t key_state = KEY_STATE_IDLE;      // 当前按键状态
+static int64_t key_debounce_tick = 0;               // 消抖时间戳
+
+/**
+ * @brief 非阻塞式按键扫描函数
+ * @return 按键编号（1=Boot按钮），0=无按键
+ */
+static uint8_t key_scan(void)
+{
+    uint8_t key_num = 0;
+    int64_t now = esp_timer_get_time();
+
+    // 读取 Boot 按钮状态（上拉输入，按下为低电平）
+    int b = gpio_get_level(BTN_MODE);
+
+    // 状态机处理
+    switch (key_state) {
+        case KEY_STATE_IDLE:
+            // 检测到按键按下（低电平）
+            if (b == 0) {
+                key_state = KEY_STATE_DEBOUNCE;
+                key_debounce_tick = now;
+            }
+            break;
+            
+        case KEY_STATE_DEBOUNCE:
+            // 20ms 消抖检测
+            if (now - key_debounce_tick > 20000) {
+                if (b == 0) {
+                    // 确认按键按下
+                    key_state = KEY_STATE_PRESSED;
+                } else {
+                    // 抖动，回到空闲状态
+                    key_state = KEY_STATE_IDLE;
+                }
+            }
+            break;
+            
+        case KEY_STATE_PRESSED:
+            // 检测按键释放（高电平）
+            if (b == 1) {
+                key_state = KEY_STATE_IDLE;
+                key_num = 1;  // 返回按键编号
+            }
+            break;
+    }
+
+    return key_num;
+}
+
+/**
+ * @brief 检查按钮状态并处理模式切换
+ */
+static void check_buttons(void)
+{
+    uint8_t key = key_scan();
+    
+    if (key == 1) {
+        // 切换控制模式
+        control_mode = !control_mode;
+        
+        if (control_mode == MODE_GESTURE) {
+            ESP_LOGI(TAG, ">>> Boot 按钮: 切换到手势控制模式");
+        } else {
+            ESP_LOGI(TAG, ">>> Boot 按钮: 切换到模型控制模式");
+        }
+        
+        // 重置状态
+        apply_led(0);
+        pc_brightness = 0;
+        gesture_expire = 0;
+    }
+}
+
+/**
+ * @brief 初始化按钮 GPIO
+ */
+static void buttons_init(void)
+{
+    gpio_config_t btn_cfg = {
+        .intr_type    = GPIO_INTR_DISABLE,  // 禁用中断
+        .mode         = GPIO_MODE_INPUT,    // 输入模式
+        .pin_bit_mask = (1ULL << BTN_MODE), // Boot 按钮引脚
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE, // 启用内部上拉
+    };
+    gpio_config(&btn_cfg);
+    
+    // 等待稳定
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 输出初始状态
+    int lv0 = gpio_get_level(BTN_MODE);
+    ESP_LOGI(TAG, "按钮初始化: IO0=%d (1=未按下, Boot Button)", lv0);
+}
+
+/**
+ * @brief 主程序入口
+ */
 void app_main(void)
 {
-    led_init();  // 初始化 GPIO46 LED
+    // 初始化 LED 和 PWM
+    led_init();
+    led_pwm_init();
+    
+    // 初始化 LCD 并清屏
+    lcd_init();
+    lcd_clear(BLUE);
 
-    // 1. 初始化手势传感器（使用 I2C_NUM_1）
-    apds9960_handle_t apds9960 = init_apds9960();
-    if (!apds9960) {
-        ESP_LOGW(TAG, "APDS9960 not available, gesture disabled");
-    }
+    // 初始化手势传感器
+    init_apds9960();
+    
+    // 初始化摄像头
+    camera_init();
+    
+    // 初始化 WiFi
+    wifi_init();
+    
+    // 初始化按钮
+    buttons_init();
 
-    // 2. 初始化摄像头（使用 I2C_NUM_0）
-    if (init_camera() != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed, system halt");
+    // 输出启动信息
+    ESP_LOGI(TAG, "启动完成，当前模式: 手势控制");
+
+    // 创建 UDP 图像传输套接字
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        ESP_LOGE(TAG, "创建 UDP 套接字失败");
         return;
     }
+    
+    // 设置发送缓冲区大小
+    int snd = 64 * 1024;
+    setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
 
-    // 3. 主循环：手势轮询 50ms，拍照间隔 5 秒
-    uint32_t last_capture_time = 0;
-    const uint32_t capture_interval_ms = 5000;
-    uint32_t current_time;
+    // 创建 UDP 命令接收套接字
+    cmd_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (cmd_sock < 0) {
+        ESP_LOGE(TAG, "创建 CMD 套接字失败");
+        return;
+    }
+    
+    // 绑定命令端口
+    struct sockaddr_in cmd_addr = {0};
+    cmd_addr.sin_family = AF_INET;
+    cmd_addr.sin_port = htons(CMD_PORT);
+    cmd_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(cmd_sock, (struct sockaddr *)&cmd_addr, sizeof(cmd_addr));
 
+    // 设置 PC 端地址
+    memset(&pc_addr, 0, sizeof(pc_addr));
+    pc_addr.sin_family = AF_INET;
+    pc_addr.sin_port = htons(UDP_PORT);
+    pc_addr.sin_addr.s_addr = inet_addr(PC_IP);
+
+    // 输出网络配置信息
+    ESP_LOGI(TAG, "UDP 图像传输: %s:%d", PC_IP, UDP_PORT);
+    ESP_LOGI(TAG, "UDP 命令接收: :%d", CMD_PORT);
+    ESP_LOGI(TAG, "摄像头 240x240 流传输中...");
+
+    uint32_t seq = 0;                    // 帧序号
+    TickType_t last_log = xTaskGetTickCount();  // 上次日志时间
+
+    // 主循环
     while (1) {
-        current_time = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-        // 手势轮询
-        if (apds9960 && apds9960_gesture_valid(apds9960)) {
-            uint8_t gesture = apds9960_read_gesture(apds9960);
-            gesture_callback(gesture);
+        // 获取摄像头帧
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
-        // 定时拍照
-        if ((current_time - last_capture_time) >= capture_interval_ms) {
-            camera_fb_t *fb = esp_camera_fb_get();
-            if (fb) {
-                ESP_LOGI(TAG, "Captured %zu bytes", fb->len);
-                esp_camera_fb_return(fb);
-            } else {
-                ESP_LOGE(TAG, "Capture failed");
-            }
-            last_capture_time = current_time;
+        // 在 LCD 上显示帧
+        show_frame(fb);
+
+        // 将帧转换为 JPEG
+        uint8_t *jpg_buf = NULL;
+        size_t jpg_len = 0;
+
+        if (fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
+                    PIXFORMAT_RGB565, 70, &jpg_buf, &jpg_len)) {
+
+            // 构建图像帧头（10字节）
+            uint8_t header[10];
+            header[0] = 0xFF;  // JPEG 起始标记
+            header[1] = 0xD8;
+            memcpy(&header[2], &seq, 4);  // 帧序号
+            header[6] = (uint8_t)(fb->width & 0xFF);       // 宽度低字节
+            header[7] = (uint8_t)((fb->width >> 8) & 0xFF); // 宽度高字节
+            header[8] = (uint8_t)(fb->height & 0xFF);      // 高度低字节
+            header[9] = (uint8_t)((fb->height >> 8) & 0xFF);// 高度高字节
+
+            // 使用 scatter-gather I/O 发送数据
+            struct iovec iov[2];
+            iov[0].iov_base = header;
+            iov[0].iov_len = 10;
+            iov[1].iov_base = jpg_buf + 2;  // 跳过 JPEG 起始标记（已在 header 中）
+            iov[1].iov_len = jpg_len - 2;
+
+            struct msghdr msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_name = &pc_addr;
+            msg.msg_namelen = sizeof(pc_addr);
+            msg.msg_iov = iov;
+            msg.msg_iovlen = 2;
+
+            // 发送到 PC
+            sendmsg(udp_sock, &msg, 0);
+            free(jpg_buf);
+            seq++;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // 返回帧缓冲区
+        esp_camera_fb_return(fb);
+
+        // 检查按钮状态
+        check_buttons();
+        
+        // 执行控制逻辑
+        control_tick();
+
+        // 每 5 秒输出一次统计信息
+        TickType_t now = xTaskGetTickCount();
+        if (now - last_log > pdMS_TO_TICKS(5000)) {
+            ESP_LOGI(TAG, "已发送 %lu 帧, LED亮度=%d", (unsigned long)seq, current_brightness);
+            last_log = now;
+            seq = 0;
+        }
+
+        // 延时约 33ms（约 30fps）
+        vTaskDelay(pdMS_TO_TICKS(33));
     }
 }

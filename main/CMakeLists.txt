@@ -1,5 +1,13 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES apds9960
+                    REQUIRES APDS9960
+                    REQUIRES CAMERA
                     REQUIRES led
-                    REQUIRES esp32-camera)  # 只需要原生驱动，无其他依赖)
+                    REQUIRES driver
+                    REQUIRES LCD
+                    REQUIRES SPI
+                    REQUIRES nvs_flash
+                    REQUIRES esp_wifi
+                    REQUIRES esp_netif
+                    REQUIRES esp_timer
+                    )
