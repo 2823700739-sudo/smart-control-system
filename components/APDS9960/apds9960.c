@@ -38,7 +38,7 @@ static const char *TAG = "APDS9960";
 #define APDS9960_SDA_IO      GPIO_NUM_1       // SDA 引脚 (IO1)
 #define APDS9960_INT_IO      GPIO_NUM_3       // INT 引脚 (IO3)
 #define APDS9960_I2C_ADDR    APDS9960_I2C_ADDRESS  // 设备地址
-#define I2C_MASTER_FREQ_HZ   100000           // I2C 频率
+#define I2C_MASTER_FREQ_HZ   400000           // I2C 频率
 
 // 初始化配置
 #define POWER_ON_DELAY_MS    100              // 上电稳定延时(ms)

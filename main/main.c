@@ -65,9 +65,9 @@ static int pc_brightness = 0;         // PC 模型控制的亮度值
 static int64_t gesture_expire = 0;    // 手势控制超时时间戳
 static int current_brightness = -1;   // 当前 LED 亮度
 
-/**
- * @brief 设置 LED 亮度
- * @param level 亮度级别 (0=OFF, 1=LOW, 2=MED, 3=HIGH)
+/*
+设置 LED 亮度
+亮度级别 (0=OFF, 1=LOW, 2=MED, 3=HIGH)
  */
 static void apply_led(int level)
 {
